@@ -1,0 +1,445 @@
+---
+title: "TripAdvisor Analysis"
+format:
+  html:
+    code-fold: true
+    self-contained: true
+jupyter: python3
+---
+ 
+
+```{python}
+import duckdb
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import os
+import plotly.express as px
+import plotly.io as pio
+```
+
+```{python}
+duck_con = duckdb.connect('tripadvisor.db')
+```
+
+
+## Task 1: Understanding User Journeys
+### How many days pass from first event until first visit at TripAdvisor
+
+
+```{python}
+days_between_before_first_visit = duck_con.execute("""
+WITH prebase_first_visit AS (
+    SELECT userid,
+        date_casted,
+        event_order
+    FROM clickstream2
+    WHERE visit_tripadvisor = TRUE
+        AND day_visited_number = 1
+)
+SELECT first_event.userid,
+    first_event.date_casted first_date_event,
+    prebase_first_visit.date_casted first_date_visit,
+    DATE_DIFF('day', first_event.date_casted, prebase_first_visit.date_casted) days_between
+FROM clickstream2 first_event
+INNER JOIN prebase_first_visit ON first_event.userid = prebase_first_visit.userid
+WHERE first_event.event_order = 1"""
+).df()
+
+# show the cumulative percent of users from day 1 to day 30 
+all_days = days_between_before_first_visit['days_between'].value_counts().sort_index().reset_index()
+all_days.columns = ['days_between', 'count']
+all_days['cumulative_percent'] = round((all_days['count'].cumsum()/len(days_between_before_first_visit))*100, 2)
+
+until_n_day = 60
+only_30_days = all_days[all_days['days_between'] <= until_n_day]
+
+# plot with plotly the cumulative percent of users from day 1 to day until_n_day
+# Add a annotation only when the cumulative percent is 80%
+
+fig = px.line(
+    only_30_days,
+    x="days_between",
+    y="cumulative_percent",
+    title="How many days pass between the first event and the first visit?",
+)
+# Set fig axis Y from 0 to 100 and X from 0 to 30
+fig.update_yaxes(range=[0, 100])
+fig.update_xaxes(range=[0, until_n_day])
+
+fig.update_layout(
+    xaxis_title="Days between first event and first visit",
+    yaxis_title="Cumulative percent of users",
+    showlegend=False,
+)
+
+users_80_percent = only_30_days[only_30_days["cumulative_percent"] >= 20]
+x_value = users_80_percent["days_between"].min()
+y_value = users_80_percent["cumulative_percent"].min()
+fig.add_annotation(
+    x=x_value,
+    y=y_value,
+    text=f"{round(y_value)}% of users have first visit in {x_value} days",
+    showarrow=True,
+    arrowhead=1,
+)
+fig.show(renderer="notebook")
+```
+
+
+### How many days have passed since the session prior to visiting TripAdvisor?
+
+
+```{python}
+days_between_before_first_visit_and_last_session = duck_con.execute("""
+WITH prebase_first_visit AS (
+    SELECT userid,
+        date_casted,
+        event_order
+    FROM clickstream2
+    WHERE visit_tripadvisor = TRUE
+        AND day_visited_number = 1
+),
+previous_session AS (
+SELECT clickstream2.userid,
+    MAX(clickstream2.date_casted) previous_date_casted
+FROM clickstream2
+INNER JOIN prebase_first_visit ON clickstream2.userid = prebase_first_visit.userid
+WHERE clickstream2.date_casted < prebase_first_visit.date_casted
+GROUP BY clickstream2.userid
+)
+SELECT prebase_first_visit.userid,
+    previous_session.previous_date_casted,
+    prebase_first_visit.date_casted first_date_visit,
+    DATE_DIFF('day', previous_session.previous_date_casted, prebase_first_visit.date_casted) days_between
+FROM prebase_first_visit 
+INNER JOIN previous_session ON previous_session.userid = prebase_first_visit.userid"""
+).df()
+
+# show the cumulative percent of users from day 1 to day 30 
+all_days = days_between_before_first_visit_and_last_session['days_between'].value_counts().sort_index().reset_index()
+all_days.columns = ['days_between', 'count']
+all_days['cumulative_percent'] = round((all_days['count'].cumsum()/len(days_between_before_first_visit_and_last_session))*100, 2)
+
+until_n_day = 30
+only_30_days = all_days[all_days['days_between'] <= until_n_day]
+
+# plot with plotly the cumulative percent of users from day 1 to day until_n_day
+# Add a annotation only when the cumulative percent is 80%
+
+fig = px.line(
+    only_30_days,
+    x="days_between",
+    y="cumulative_percent",
+    title="How many days have passed since the session prior to visiting TripAdvisor?",
+)
+# Set fig axis Y from 0 to 100 and X from 0 to 30
+fig.update_yaxes(range=[0, 100])
+fig.update_xaxes(range=[0, until_n_day])
+
+fig.update_layout(
+    xaxis_title="Days between previous session and first visit",
+    yaxis_title="Cumulative percent of users",
+    showlegend=False,
+)
+
+# Set percent of 2 standard deviation
+users_80_percent = only_30_days[only_30_days["cumulative_percent"] >= 95]
+x_value = users_80_percent["days_between"].min()
+y_value = users_80_percent["cumulative_percent"].min()
+fig.add_annotation(
+    x=x_value,
+    y=y_value,
+    text=f"{round(y_value)}% of users have first visit in {x_value} days",
+    showarrow=True,
+    arrowhead=1,
+)
+fig.show(renderer="notebook")
+```
+
+With this result, we see that we can create the sequence of the 5 days prior to the first visit to TripAdvisor
+
+### Most frequent urls in user journey before visit TripAdvisor
+
+```{python}
+duck_con.execute("""SELECT url, COUNT(0) as count 
+FROM user_sequence
+GROUP BY url
+ORDER BY count DESC
+LIMIT 10;
+""").df()
+```
+
+This result does not give us many insights, that is why we group by domain
+
+### Most frequent domains in user journey before visit TripAdvisor
+
+```{python}
+frequent_domains = duck_con.execute("""SELECT domain, COUNT(0) as total_events 
+FROM user_sequence_domains
+GROUP BY domain
+ORDER BY total_events DESC
+LIMIT 25;
+""").df()
+
+# Plot a tree map with plotly
+fig = px.treemap(
+    frequent_domains,
+    path=["domain"],
+    values="total_events",
+    title="What are the 25 most frequent domains visited by users in his User Journey to TripAdvisor?",
+)
+fig.update_traces(
+    textinfo="label+value+percent root",
+    hovertemplate="<b>%{label}</b> <br> %{value} events",
+)
+fig.show(renderer="notebook")
+```
+
+### What if we categorize this?
+
+```{python}
+child_treemap = duck_con.execute("""
+WITH prebase_domains_categories AS (
+    SELECT user_sequence_domains.domain,
+        CASE WHEN category IS NULL THEN 'Other' ELSE category END AS category,
+        COUNT(0) as total_events
+FROM user_sequence_domains
+LEFT JOIN websites_categories ON user_sequence_domains.domain = websites_categories.domain
+GROUP BY user_sequence_domains.domain, 2
+)
+SELECT category, domain, CAST(total_events AS INT) as total_events
+FROM prebase_domains_categories
+ORDER BY total_events DESC
+LIMIT 50;
+""").df()
+
+# Plot a tree map with plotly
+fig = px.treemap(
+    child_treemap,
+    path=["category", "domain"],
+    values="total_events",
+    title="What are the 50 most frequent domains segmented by category visited by users?",
+)
+
+fig.update_traces(
+    textinfo="label+value+percent parent",
+    hovertemplate="<b>%{label}</b> <br> %{value} events <br> %{percentParent:.2f} of %{parent}",
+)
+fig.show(renderer="notebook")
+```
+
+### Now let's try with last event touch before landing TripAdvisor
+
+```{python}
+child_treemap = duck_con.execute("""
+WITH prebase_domains_categories AS (
+    SELECT user_sequence_domains.domain,
+        CASE WHEN category IS NULL THEN 'Other' ELSE category END AS category,
+        COUNT(0) as total_events
+FROM user_sequence_domains
+LEFT JOIN websites_categories ON user_sequence_domains.domain = websites_categories.domain
+WHERE reverse_sequence = 1
+GROUP BY user_sequence_domains.domain, 2
+)
+SELECT category, domain, CAST(total_events AS INT) as total_events
+FROM prebase_domains_categories
+ORDER BY total_events DESC
+LIMIT 50;
+""").df()
+
+# Plot a tree map with plotly
+fig = px.treemap(
+    child_treemap,
+    path=["category", "domain"],
+    values="total_events",
+    title="What are the 50 most frequent domains segmented by category visited by users?",
+)
+
+fig.update_traces(
+    textinfo="label+value+percent parent",
+    hovertemplate="<b>%{label}</b> <br> %{value} events <br> %{percentParent:.2f} of %{parent}",
+)
+
+fig.show(renderer="notebook")
+```
+
+### Most frequent 10 User Journeys using the 5 steps above before getting to TripAdvisor
+
+```{python}
+most_frequent_user_journeys = duck_con.execute("""
+WITH prebase_data AS (
+SELECT userid,
+    CASE WHEN category IS NULL THEN 'Other' ELSE category END AS category,
+    user_sequence_domains.domain,
+    reverse_sequence
+FROM user_sequence_domains
+LEFT JOIN websites_categories ON user_sequence_domains.domain = websites_categories.domain
+WHERE reverse_sequence <= 5
+),
+-- Now transform table to get column category_1, domain_1, category_2, domain_2, etc. 
+-- Instead of one row per user per sequence, have one row per user with all sequences
+prebase_journeys AS (
+SELECT 
+    userid,
+    MAX(CASE WHEN reverse_sequence = 5 THEN category ELSE NULL END) AS category_1,
+    MAX(CASE WHEN reverse_sequence = 5 THEN domain ELSE NULL END) AS domain_1,
+    MAX(CASE WHEN reverse_sequence = 4 THEN category ELSE NULL END) AS category_2,
+    MAX(CASE WHEN reverse_sequence = 4 THEN domain ELSE NULL END) AS domain_2,
+    MAX(CASE WHEN reverse_sequence = 3 THEN category ELSE NULL END) AS category_3,
+    MAX(CASE WHEN reverse_sequence = 3 THEN domain ELSE NULL END) AS domain_3,
+    MAX(CASE WHEN reverse_sequence = 2 THEN category ELSE NULL END) AS category_4,
+    MAX(CASE WHEN reverse_sequence = 2 THEN domain ELSE NULL END) AS domain_4,
+    MAX(CASE WHEN reverse_sequence = 1 THEN category ELSE NULL END) AS category_5,
+    MAX(CASE WHEN reverse_sequence = 1 THEN domain ELSE NULL END) AS domain_5
+FROM prebase_data
+GROUP BY userid
+)
+SELECT domain_1,
+    domain_2,
+    domain_3,
+    domain_4,
+    domain_5,
+    COUNT(0) AS total_users
+FROM prebase_journeys
+GROUP BY domain_1,
+    domain_2,
+    domain_3,
+    domain_4,
+    domain_5
+ORDER BY total_users DESC
+LIMIT 10;
+""").df()
+
+most_frequent_user_journeys
+```
+
+```{python}
+most_frequent_user_journeys = duck_con.execute("""
+WITH prebase_data AS (
+SELECT userid,
+    CASE WHEN category IS NULL THEN 'Other' ELSE category END AS category,
+    user_sequence_domains.domain,
+    reverse_sequence
+FROM user_sequence_domains
+LEFT JOIN websites_categories ON user_sequence_domains.domain = websites_categories.domain
+WHERE reverse_sequence <= 5
+),
+-- Now transform table to get column category_1, domain_1, category_2, domain_2, etc. 
+-- Instead of one row per user per sequence, have one row per user with all sequences
+prebase_journeys AS (
+SELECT 
+    userid,
+    MAX(CASE WHEN reverse_sequence = 5 THEN category ELSE NULL END) AS category_1,
+    MAX(CASE WHEN reverse_sequence = 5 THEN domain ELSE NULL END) AS domain_1,
+    MAX(CASE WHEN reverse_sequence = 4 THEN category ELSE NULL END) AS category_2,
+    MAX(CASE WHEN reverse_sequence = 4 THEN domain ELSE NULL END) AS domain_2,
+    MAX(CASE WHEN reverse_sequence = 3 THEN category ELSE NULL END) AS category_3,
+    MAX(CASE WHEN reverse_sequence = 3 THEN domain ELSE NULL END) AS domain_3,
+    MAX(CASE WHEN reverse_sequence = 2 THEN category ELSE NULL END) AS category_4,
+    MAX(CASE WHEN reverse_sequence = 2 THEN domain ELSE NULL END) AS domain_4,
+    MAX(CASE WHEN reverse_sequence = 1 THEN category ELSE NULL END) AS category_5,
+    MAX(CASE WHEN reverse_sequence = 1 THEN domain ELSE NULL END) AS domain_5
+FROM prebase_data
+GROUP BY userid
+)
+SELECT category_1,
+    category_2,
+    category_3,
+    category_4,
+    category_5,
+    COUNT(0) AS total_users
+FROM prebase_journeys
+GROUP BY category_1,
+    category_2,
+    category_3,
+    category_4,
+    category_5
+ORDER BY total_users DESC
+LIMIT 10;
+""").df()
+
+most_frequent_user_journeys
+```
+
+### Size of User Journeys
+
+```{python}
+domain_journeys = duck_con.execute(
+    """SELECT userid,
+    COUNT(0) AS total_steps
+FROM user_sequence_domains
+GROUP BY userid;"""
+).df()
+
+# Plot a histogram with plotly
+fig = px.histogram(
+    domain_journeys,
+    x="total_steps",
+    title="How many steps do users take in their journeys?",
+)
+fig.update_layout(
+    xaxis_title="Number of steps",
+    yaxis_title="Number of users",
+    showlegend=False,
+)
+fig.show(renderer="notebook")
+```
+
+### How many steps we need to track to get 80% and 95% of User Journeys?
+
+```{python}
+# Calculate the cumulative percent of users  
+all_events = domain_journeys['total_steps'].value_counts().sort_index().reset_index()
+all_events.columns = ['total_steps', 'count']
+all_events['cumulative_percent'] = round((all_events['count'].cumsum()/len(domain_journeys))*100, 2)
+
+# plot with plotly the cumulative percent of users from day 1 to day until_n_day
+# Add a annotation only when the cumulative percent is 80% and 95%
+fig = px.line(
+    all_events,
+    x="total_steps",
+    y="cumulative_percent",
+    title="How many events do users take in their journeys?",
+)
+# Set fig axis Y from 0 to 100
+fig.update_yaxes(range=[0, 100])
+
+
+fig.update_layout(
+    xaxis_title="Number of events",
+    yaxis_title="Cumulative percent of users",
+    showlegend=False,
+)
+
+users_80_percent = all_events[all_events["cumulative_percent"] >= 80]
+x_value = users_80_percent["total_steps"].min()
+y_value = users_80_percent["cumulative_percent"].min()
+fig.add_annotation(
+    x=x_value,
+    y=y_value,
+    text=f"{round(y_value)}% of users have {x_value} events",
+    showarrow=True,
+    arrowhead=1,
+)
+
+users_95_percent = all_events[all_events["cumulative_percent"] >= 95]
+x_value = users_95_percent["total_steps"].min()
+y_value = users_95_percent["cumulative_percent"].min()
+fig.add_annotation(
+    x=x_value,
+    y=y_value,
+    text=f"{round(y_value)}% of users have {x_value} events",
+    showarrow=True,
+    arrowhead=1,
+)
+
+fig.show(renderer="notebook")
+```
+
+### What is the longest User Journey?
+
+```{python}
+# Get the User Journey with the most steps
+domain_journeys.sort_values(by="total_steps", ascending=False).head(1)
+```
